@@ -1,0 +1,297 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var ls5 = ee.ImageCollection("LANDSAT/LT05/C01/T1_SR"),
+    ls8 = ee.ImageCollection("LANDSAT/LC08/C01/T1_SR"),
+    elev = ee.Image("USGS/SRTMGL1_003"),
+    ls7 = ee.ImageCollection("LANDSAT/LE07/C01/T1_SR"),
+    ssc_usa_training_stations = ee.FeatureCollection("users/edethier/qwdv_sts_3km"),
+    hydro_rivers = ee.FeatureCollection("users/edethier/HydroRIVERS_3km2"),
+    flow_acc = ee.Image("WWF/HydroSHEDS/15ACC"),
+    arcticDEM = ee.Image("UMN/PGC/ArcticDEM/V3/2m_mosaic");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+//// Evan Dethier
+// 2020
+// Procedure for extracting landsat data from inland water bodies
+
+//// INITIALIZE THRESHOLDS, DATES
+var b7_thresh = 500 // determining water
+var b1_thresh = 1700 // for masking snow
+var nd_thresh = 0; // default nd threshold
+
+//for export images
+var start1 = '1984-01-01';
+var end1 = '2021-01-01';
+
+
+  //masks out clouds, snow, etc.
+  var waterOnly = function(image){ 
+    var land = image.select('B7').lt(b7_thresh)
+    var cloudFinal = image.select('B1').add(image.select('B2'))
+        .lt(5000) // usually .lt(3500), but not >>ssc, like white r. SD
+
+    var qa = image.select('pixel_qa')
+    var bitcloud = qa.bitwiseAnd(1 << 5)
+            .and(qa.bitwiseAnd(1 << 7))
+            .or(qa.bitwiseAnd(1 << 3))    
+            // .or(qa.bitwiseAnd(1 << 4)) 
+    
+    var snow_ice_qa = qa
+        .updateMask(qa.bitwiseAnd(1 << 4)).rename('snow_ice_qa')
+        
+    var cloud_qa = qa
+        .updateMask(qa.bitwiseAnd(1 << 5)
+            .and(qa.bitwiseAnd(1 << 7))
+            .or(qa.bitwiseAnd(1 << 3))).rename('cloud_qa')
+            
+    var snow_ice_qa_b1 = image.select('B1').lt(b1_thresh)       
+            
+    var nd = image.normalizedDifference(['B5','B2'])
+    return image.addBands(nd)
+            .updateMask(cloudFinal)
+            .updateMask(land)
+            .updateMask(bitcloud.not())
+            .updateMask(nd.lt(nd_thresh))
+            .updateMask(snow_ice_qa_b1)
+            .addBands(snow_ice_qa)
+            .addBands(cloud_qa);
+  };
+
+ // Remove clouds, snow, ice. Do not use MNDWI or other water classifiers
+  var noClouds = function(image){
+    var land = image.select('B7').lt(b7_thresh)
+    var cloudFinal = image.select('B1').add(image.select('B2'))
+        .lt(5000) // usually .lt(3500), but not >>ssc, like white r. SD
+  
+    var qa = image.select('pixel_qa')
+    var bitcloud = qa.bitwiseAnd(1 << 5)
+            .and(qa.bitwiseAnd(1 << 7))
+            .or(qa.bitwiseAnd(1 << 3))    
+            // .or(qa.bitwiseAnd(1 << 4)) 
+            
+    var snow_ice_qa = image.select('B1').lt(b1_thresh)        
+    return image
+            .updateMask(cloudFinal)
+            .updateMask(snow_ice_qa)
+            .updateMask(land)
+            .updateMask(bitcloud.not())
+  };
+
+//// FUNCTIONS FOR HANDLING TRAINING SITES
+  // Buffer geometry of feature
+    // by 200 m
+    var featureBuffer = function(feature){
+      var lon = feature.geometry().centroid().coordinates().get(0);
+      var lat = feature.geometry().centroid().coordinates().get(1);
+      return feature.setGeometry(feature.geometry().buffer(200)).set({'lon':lon,'lat':lat});
+    };
+    // by 500 m
+    var featureBuffer500 = function(feature){
+      return feature.setGeometry(feature.geometry().buffer(500));
+    };
+
+  // set latitude and longitude properties for feature from its geometry, set geometry null
+    var getLatLon = function(feature){
+      var lon = feature.geometry().centroid().coordinates().get(0);
+      var lat = feature.geometry().centroid().coordinates().get(1);
+      return feature.set({'lon':lon,'lat':lat});
+    };
+    
+  // Get feature centroid
+    var getCentroid = function(feature){
+      return feature.setGeometry(feature.geometry().centroid())
+    }
+
+  // Add date from Landsat image as property
+    var addDate = function(image){
+      var date1 = ee.Date(image.get('system:time_start')).format('dd MMM yyyy');
+      return image.set({'date': date1})
+    };
+
+// Get training site information, standardize for all agencies
+// For Taiwan
+var getSiteName = function(feature){
+  return(feature.set('name',feature.get('SiteEngName')))}
+  
+// For South America
+var getSiteNo = function(feature){
+  return(feature.set('site_no',feature.get('name')))}
+
+// For Canada
+var getSiteNo_location_canada = function(feature){
+  return(feature
+    .setGeometry(ee.Geometry.Point(
+      [feature.get('Mean(Longitude)'),feature.get('Mean(Latitude)')]))
+    .set('site_no',feature.get('StationName'), 'name',feature.get('StationName')))}
+  
+// get lat/lon for each site, export to drive
+var taiwan_sites = ee.FeatureCollection('ft:1i73dT8jPHA5rLl_wxg_igc6UxQKjRPX0geaUoHYf')
+              .map(getSiteName) // add site name as the Taiwan site English name
+              .map(getSiteNo) // add site number as the Taiwan site name
+              .map(getLatLon); // add lat and lon as properties
+var SAmerica_sites = ee.FeatureCollection("ft:1vgedGBGzitATHu64cKwdIEUAAvLg70Icb7zj-GjA")
+              .map(getSiteNo) // add site number as the south american site name
+              .map(getLatLon) // add lat and lon as properties
+              
+var canada_sites = ee.FeatureCollection("ft:1pt4d5ofshlMOb3iw-qOqjdkoi9N969ecqsAgoYdx")
+
+var canada_sites = canada_sites
+              .map(getSiteNo_location_canada) // add site number as the south american site name
+              .map(getLatLon) // add lat and lon as properties
+             
+
+var usa_sites_simple = ssc_usa_training_stations
+          .map(getLatLon)
+          .filterMetadata('drng__2', 'greater_than', 3000)
+
+var trainingSites = usa_sites_simple
+        .merge(taiwan_sites)
+        .merge(SAmerica_sites)
+        .merge(canada_sites)
+
+print('training sites', trainingSites)
+// // Export site latitude and longitude
+// Export.table.toDrive(trainingSites)
+
+
+var trainingSites = trainingSites.map(featureBuffer)
+
+// Get reducers for topographic information extraction
+var topo_reducers = ee.Reducer.max()
+      .combine(ee.Reducer.median(), null, true)
+      // .combine(ee.Reducer.stdDev(), null, true)
+      .combine(ee.Reducer.min(), null, true);
+
+// Extract longitudinal profile, etc.     
+var topoExtract = function(image){
+  var fc_export = image
+  .reduceRegions({
+  collection: trainingSites.map(featureBuffer500),
+  reducer:topo_reducers, 
+  scale:30, 
+  }).select(
+  'elev_min',
+  'elev_median',
+  'flow_acc_max',
+  'name',
+  'site_no',
+  'lat',
+  'lon'
+  );
+  
+  return fc_export
+    .map(function(feature){
+    return(feature.setGeometry(null)); // remove geometry from feature for efficiency
+  })
+};
+
+// Merge arctic DEM with SRTM DEM for global coverage
+var elev = ee.ImageCollection([elev.rename('elev'),
+                              arcticDEM.rename('elev').short()]).median()    
+// Get topography for sites/transects                              
+var station_topo = topoExtract(elev
+                                .addBands(flow_acc.rename('flow_acc'))
+                                )
+
+// Print test results
+print('test topo',station_topo)
+print('hydro_rivers',hydro_rivers.first())
+
+// Map training sites
+Map.addLayer(trainingSites,{color:'red'},'topo stations')
+
+// Export topography data to Drive
+Export.table.toDrive({
+  collection: station_topo,
+  fileNamePrefix: 'ls_training_station_topo',
+  description: 'ls_training_station_topo',
+  fileFormat:'CSV',
+  folder: 'ls_training_stations'
+})
+
+//// IMAGE PROCESSING
+var ls_imgs_base = ls5.merge(ls7)
+          // .filterBounds(aoi) // for individual site
+          .filterBounds(trainingSites.map(getCentroid))
+          .filterDate(start1,end1)
+          // .filter(ee.Filter.calendarRange(1,2,'month')) // optional filter by time of year
+
+var reducers = ee.Reducer.median()
+      // .combine(ee.Reducer.mean(), null, true)
+      // .combine(ee.Reducer.stdDev(), null, true)
+      .combine(ee.Reducer.count(), null, true);  
+      
+var bandExtract = function(image){
+  var fc_for_reduce = trainingSites.filterBounds(image.geometry())
+  // var fc_for_snow = fc_for_reduce.map(featureBuffer3000)
+  var fc_export = image
+  .reduceRegions({
+  collection: fc_for_reduce,
+  // collection: ee.FeatureCollection(ee.Feature(aoi.buffer(400))),
+  reducer:reducers
+  // scale:30, 
+  }).select(
+  'name',
+  'lat',
+  'lon',
+  'B1_median',
+  'B2_median',
+  'B3_median',
+  'B4_median',
+  'B5_median',
+  'B6_median',
+  'B7_median',
+  'B2_count',
+  'nd_median',
+  'pixel_qa_median',
+  'radsat_qa_median',
+  'sr_atmos_opacity_median',
+  'sr_cloud_qa_median',
+  'cloud_qa_count',
+  'snow_ice_qa_count'
+  );
+  
+  // // Add a local snow flag
+  // var fc_nearby_snow = image.select('snow_ice_qa').rename('snow_ice_qa_3km')
+  //           .addBands(image.select('cloud_qa').rename('cloud_qa_3km'))
+  //         .reduceRegions({
+  //             collection: fc_export.map(featureBuffer1000),
+  //             reducer:ee.Reducer.count()
+  // })
+  
+  // return fc_nearby_snow.map(function(feature){
+  return fc_export.map(function(feature){
+    var properties = ee.Dictionary([
+        'date',ee.Date(image.get('system:time_start')).format('yyyy-MM-dd'),
+        'cloud_cover', image.get('CLOUD_COVER'), 
+        'solar_az', image.get('SOLAR_AZIMUTH_ANGLE'),
+        'solar_zen', image.get('SOLAR_ZENITH_ANGLE'),
+        'sensor', image.get('SATELLITE'),
+        'img_qual',image.get('IMAGE_QUALITY')])
+    
+    // remove geometry from feature for efficiency, set properties from image
+    return feature.setGeometry(null).set(properties); 
+  });
+  
+}
+
+// All Landsat images for training
+  var train_imgs = ls_imgs_base
+      .map(waterOnly) // Filter out all but water
+      .map(bandExtract) // Extract spectral data at each in situ station
+  
+  var train_imgs_export = train_imgs
+    .flatten()
+    .filterMetadata('B2_count','greater_than',0)
+    
+
+print('n images',train_imgs.size())
+print('test image band extract, no null',train_imgs_export.first())
+
+// Export training data
+Export.table.toDrive({
+  collection: train_imgs_export, 
+  description: 'river_training_ls57_rawBands_b7lt500',
+  fileNamePrefix: 'river_training_ls57_rawBands_b7lt500', 
+  fileFormat:'csv'
+  })
+
+      
